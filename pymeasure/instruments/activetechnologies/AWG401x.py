@@ -363,6 +363,72 @@ class ChannelAWG(ChannelBase):
         super().__init__(instrument, channel_number)
 
 
+class DigitalChannelProbe(Instrument):
+    """Implementation of a base Active Technologies AWG-4000 digital channel
+    probe (8 digital channels group) used in AWG mode."""
+
+    voltage = Instrument.control(
+        "DIGitals:LEVel<group>?", "DIGitals:LEVel<group> %f",
+        """This property sets or returns the Voltage Level of the digital
+        output probe.""",
+        validator=strict_range,
+        dynamic=True
+    )
+
+    voltage_max = Instrument.measurement(
+        "DIGitals:LEVel<group>? MAXimum",
+        """This property queries the maximum level that can be set to the
+        output probe."""
+    )
+
+    voltage_min = Instrument.measurement(
+        "DIGitals:LEVel<group>? MINimum",
+        """This property queries the minimum level that can be set to the
+        output probe."""
+    )
+
+    skew = Instrument.control(
+        "DIGitals:SKEW<group>?", "DIGitals:SKEW<group> %s",
+        """This property sets or returns the Skew of the digital output probe.
+        It sets the delay between the analog channels and the digital channels
+        in order to de-skew the analog and digital outputs. The skew between
+        analog/digital channels depends on the sampling frequency: the minimum
+        skew is 1 clock cycle @ the sampling frequency.""",
+        validator=strict_range,
+        dynamic=True
+    )
+
+    skew_max = Instrument.measurement(
+        "DIGitals:SKEW<group>? MAXimum",
+        """This property queries the maximum skew that can be set to the output
+        probe."""
+    )
+
+    skew_min = Instrument.measurement(
+        "DIGitals:SKEW<group>? MINimum",
+        """This property queries the minimum skew that can be set to the output
+        probe."""
+    )
+
+    def __init__(self, instrument, group_number):
+        self.instrument = instrument
+        self.group_number = group_number
+
+        self._special_names = self._setup_special_names()
+
+        self.voltage_values = [self.voltage_min, self.voltage_max]
+        self.skew_values = [self.skew_min, self.skew_max]
+
+    def values(self, command, **kwargs):
+        return self.instrument.values(
+            command.replace("<group>", str(self.group_number)),
+            **kwargs)
+
+    def write(self, command):
+        self.instrument.write(command.replace("<group>",
+                                              str(self.group_number)))
+
+
 class AWG401x_base(Instrument):
     """AWG-401x base class"""
 
@@ -522,8 +588,34 @@ class AWG401x_AWG(AWG401x_base):
 
     num_dch = Instrument.measurement(
         "AWGControl:CONFigure:DNUMber?",
-        """This property queries the number of digital channels.""",
+        """This property queries the maximum number of digital channels
+        available.""",
         cast=int
+    )
+
+    num_active_dch = Instrument.control(
+        "DIGitals:NUMber?",
+        "DIGitals:NUMber %d",
+        """This property sets or returns the enabled number of the digital
+        channels.
+        The maximum number of available digital lines depends on the AWG model
+        and on the installed license.
+        There are up to 8 digital lines every 2 analog channels.
+        Note: enabling the digital lines will cause a decrease of resolution in
+        the analog output channels as shown in the user manual table (Digital
+        Channels section).""",
+        validator=strict_discrete_set,
+        dynamic=True
+    )
+
+    enabled_digital = Instrument.control(
+        "DIGitals:STATe?", "DIGitals:STATe %s",
+        """A boolean property that enables the digital channels in the
+        sequencer.""",
+        validator=strict_discrete_set,
+        values={True: "ON", False: "OFF"},
+        map_values=True,
+        get_process=lambda v: "OFF" if v == 0 else "ON"
     )
 
     sample_decreasing_strategy = Instrument.control(
@@ -689,6 +781,13 @@ class AWG401x_AWG(AWG401x_base):
         self.setting_ch = {}
         for i in range(1, self.num_ch+1):
             self.setting_ch[i] = ChannelAWG(self, i)
+
+        self.num_active_dch_values = [
+            i for i in range(self.num_dch+1) if i % 2 == 0]
+
+        self.setting_dch_probe = {}
+        for i in range(1, self.num_dch//8+1):
+            self.setting_dch_probe[i] = DigitalChannelProbe(self, i)
 
         self.entries = self.DummyEntriesElements(self, self.num_ch)
         self.burst_count_values = [self.burst_count_min, self.burst_count_max]
@@ -938,6 +1037,10 @@ class SequenceEntry(Instrument):
         for i in range(1, self.number_of_channels+1):
             self.ch[i] = self.AnalogChannel(self.instrument, i, self.seq_num)
 
+        self.dch = self.DigitalChannel(self.instrument,
+                                       self.number_of_channels+1,
+                                       self.seq_num)
+
     def values(self, command, **kwargs):
         return self.instrument.values(
             command.replace("<ent>", str(self.seq_num)),
@@ -1076,3 +1179,35 @@ class SequenceEntry(Instrument):
 
             self.voltage_low_values = [self.voltage_low_min,
                                        self.voltage_low_max]
+
+    class DigitalChannel(Instrument):
+        """Implementation of the digital channel group for a single sequencer
+        entry."""
+
+        waveform = Instrument.control(
+            "SEQuence:ELEM<ent>:WAVeform<ch>?",
+            "SEQuence:ELEM<ent>:WAVeform<ch> %s",
+            """This property sets or returns the waveform. It’s possible select
+            a waveform only from those in the waveform list. In waveform list
+            are already present 10 predefined waveform: Sine, Ramp, Square,
+            Sync, DC, Gaussian, Lorentz, Haversine, Exp_Rise and Exp_Decay but
+            user can import in the list others customized waveforms.""",
+            validator=strict_discrete_set,
+            set_process=lambda v: f"\"{v}\"",
+            dynamic=True
+        )
+
+        def __init__(self, instrument, channel_number, sequence_number):
+            self.instrument = instrument
+            self.num_ch = channel_number
+            self.seq_num = sequence_number
+
+        def values(self, command, **kwargs):
+            command = command.replace("<ent>", str(self.seq_num))
+            command = command.replace("<ch>", str(self.num_ch))
+            return self.instrument.values(command, **kwargs)
+
+        def write(self, command):
+            command = command.replace("<ent>", str(self.seq_num))
+            command = command.replace("<ch>", str(self.num_ch))
+            self.instrument.write(command)
