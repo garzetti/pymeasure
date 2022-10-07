@@ -771,9 +771,15 @@ class AWG401x_AWG(AWG401x_base):
 
     waveforms = property(
         lambda self: self._waveforms,
-        doc="""This property returns a dict with all the waveform present
-        in the instrument system (Wave. List). It is possible to modify the
-        values, delete them or create new waveforms""")
+        doc="""This property returns a dict with all the analog waveform
+        present in the instrument system (Wave. List). It is possible to modify
+        the values, delete them or create new waveforms""")
+
+    dwaveforms = property(
+        lambda self: self._dwaveforms,
+        doc="""This property returns a dict with all the digital waveform
+        present in the instrument system (Wave. List). It is possible to modify
+        the values, delete them or create new waveforms""")
 
     def __init__(self, adapter, **kwargs):
         super().__init__(adapter, **kwargs)
@@ -795,7 +801,8 @@ class AWG401x_AWG(AWG401x_base):
         self.sampling_rate_values = [self.sampling_rate_min,
                                      self.sampling_rate_max]
 
-        self._waveforms = self.WaveformsLazyDict(self)
+        self._waveforms = self.AnalogWaveformsLazyDict(self)
+        self._dwaveforms = self.DigitalWaveformsLazyDict(self)
 
     def trigger(self):
         """Force a trigger event to occour."""
@@ -861,9 +868,11 @@ class AWG401x_AWG(AWG401x_base):
 
         return elements
 
-    class WaveformsLazyDict(abc.MutableMapping):
+    class BaseWaveformsLazyDict(abc.MutableMapping):
         """This class inherit from MutableMapping in order to create a custom
-        dict to lazy load, modify, delete and create instrument waveform."""
+        dict to lazy load, modify, delete and create instrument waveform.
+        This Class will be used as base class for analog and digital waveform
+        dict"""
 
         def __init__(self, instrument):
             self.instrument = instrument
@@ -876,6 +885,52 @@ class AWG401x_AWG(AWG401x_base):
             return self._data[key]
 
         def __setitem__(self, key, value):
+            """Virtual method for store new data"""
+            raise NotImplementedError()
+
+        def __delitem__(self, key):
+            """When removing an element this method removes also the
+            corresponding waveform in the instrument"""
+            self._remove_waveform(key)
+            del self._data[key]
+            return
+
+        def __iter__(self):
+            try:
+                for el in self._data:
+                    yield el
+            except KeyError:
+                return
+
+        def __len__(self):
+            return len(self._data)
+
+        def __str__(self):
+            """Virtual method returning str representation"""
+            raise NotImplementedError()
+
+        def reset(self):
+            """Virtual method for reset the data in dict"""
+            raise NotImplementedError()
+
+        def _remove_waveform(self, key, force=False):
+            """Remove waveform from instrument"""
+            if force or key in self._data.keys():
+                self.instrument.write(f'WLISt:WAVeform:DELete "{key}"')
+
+        def _get_waveform(self, waveform_name):
+            """Virtual method for receive the waveform data points"""
+            raise NotImplementedError()
+
+    class AnalogWaveformsLazyDict(BaseWaveformsLazyDict):
+        """This class inherit from BaseWaveformsLazyDict in order to create a
+        custom dict to lazy load, modify, delete and create instrument analog
+        waveforms."""
+
+        def __init__(self, instrument):
+            super().__init__(instrument)
+
+        def __setitem__(self, key, value):
             """Create a new waveform from key and value"""
 
             if len(value) < 16:
@@ -883,6 +938,7 @@ class AWG401x_AWG(AWG401x_base):
             elif len(value) < 384 and len(value) % 16 != 0:
                 raise ValueError("From 16 to 384 samples the granularity of"
                                  "the waveform is 16")
+            # TODO: Check also is the len is greater than maximum allowed
 
             class VoltageOutOfRangeError(Exception):
                 pass
@@ -917,35 +973,26 @@ class AWG401x_AWG(AWG401x_base):
             self._data[key] = None
             return
 
-        def __delitem__(self, key):
-            """When removing an element this method removes also the
-            corresponding waveform in the instrument"""
-            del self._data[key]
-            self.instrument.write(f'WLISt:WAVeform:DELete "{key}"')
-            return
-
-        def __iter__(self):
-            try:
-                for el in self._data:
-                    yield el
-            except KeyError:
-                return
-
-        def __len__(self):
-            return len(self._data)
-
         def __str__(self):
             """Return a str without the waveforms points because it is useless
             and loads all waveforms uselessy"""
-            return pprint.pformat({el: "Waveform Points" for el in self._data})
+            return pprint.pformat(
+                {el: "Analog Waveform Points" for el in self._data}
+                )
 
         def reset(self):
             """Reset the class reloading the waveforms from instrument"""
-            waveforms_name = self.instrument.values("WLISt:LIST?")
+            all_waveforms_name = self.instrument.values("WLISt:LIST?")
+            waveforms_name = []
+            for name in all_waveforms_name:
+                waveform_type = self.instrument.values(
+                    f"WLISt:WAVeform:TYPE? \"{name}\"")
+                if waveform_type[0].lower() == "analog":
+                    waveforms_name.append(name)
             self._data = {v: None for v in waveforms_name}
 
         def _get_waveform(self, waveform_name):
-            """Get the waveform point of a specified waveform"""
+            """Get the waveform points of a specified waveform"""
 
             bin_value = self.instrument.adapter.connection.query_binary_values(
                 'WLISt:WAVeform:DATA? "' + waveform_name + '"',
@@ -953,6 +1000,212 @@ class AWG401x_AWG(AWG401x_base):
                 datatype='h')
 
             return bin_value
+
+    class DigitalWaveformsLazyDict(BaseWaveformsLazyDict):
+        """This class inherit from BaseWaveformsLazyDict in order to create a
+        custom dict to lazy load, modify, delete and create instrument analog
+        waveforms."""
+
+        def __init__(self, instrument):
+            super().__init__(instrument)
+
+        def __setitem__(self, key, value):
+            """Create a new waveform from key and value"""
+
+            ## FIXME: Questo non funziona più se l'array è multidimensionale
+            #if len(value) < 16:
+                #raise ValueError("The minimum waveform length is 16 samples")
+            #elif len(value) < 384 and len(value) % 16 != 0:
+                #raise ValueError("From 16 to 384 samples the granularity of"
+                                 #"the waveform is 16")
+            # TODO: Check also is the len is greater than maximum allowed
+
+            # NOTE: Se è un vettore di interi faccio una cosa, se è un array binario ne faccio un altra
+
+            if isinstance(value[0], int):
+                # If it is an integer the value is a whole channels integer
+                # List
+                wg = self.DigitalGroupWaveform(self, key, decimal_list=value)
+            elif all([ch_point <= 1
+                      for ch_points in value
+                      for ch_point in ch_points]):
+                # If all points are less than 1 is ok
+                if all([len(ch_points) == len(value[0]) # Chi ci garantisce che il primo canale non sia una lista [] mentre gli altri no? Magari io non ho interesse a comandare il canale zero
+                        for ch_points in value]):
+                    # If all single ch Lists have the same dimension
+                    wg = self.DigitalGroupWaveform(self,
+                                                   key,
+                                                   binary_lists=value)
+                else:
+                    raise ValueError("All channels list must have the same"
+                                     "dimension")
+            else:
+                raise ValueError("Non-compliant data passed. Only single"
+                                 "dimension integer List or multi dimension"
+                                 "0-1 List are allowed")
+
+            self.save_waveform(wg)
+            self._data[key] = wg
+
+            return
+
+        def __str__(self):
+            """Return a str without the waveforms points because it is useless
+            and loads all waveforms uselessy"""
+            return pprint.pformat(
+                {el: "Digital Waveform Points" for el in self._data}
+                )
+
+        def save_waveform(self, waveform_group):
+            self.instrument.save_file(f"{waveform_group.waveform_name}.txt",
+                                      "\n".join(
+                                          map(str,
+                                              waveform_group.decimal_repr)
+                                          ), override_existing=True)
+
+            self._remove_waveform(waveform_group.waveform_name)
+
+            self.instrument.write(
+                f'WLISt:WAVeform:IMPort "{waveform_group.waveform_name}",'
+                f'"{waveform_group.waveform_name}.txt",DIGitals')
+
+            self.instrument.wait_last()
+
+            self.instrument.remove_file(f"{waveform_group.waveform_name}.txt")
+
+            self._data[waveform_group.waveform_name] = waveform_group
+            return
+
+        def reset(self):
+            """Reset the class reloading the waveforms from instrument"""
+            all_waveforms_name = self.instrument.values("WLISt:LIST?")
+            waveforms_name = []
+            for name in all_waveforms_name:
+                waveform_type = self.instrument.values(
+                    f"WLISt:WAVeform:TYPE? \"{name}\"")
+                if waveform_type[0].lower() == "digitals":
+                    waveforms_name.append(name)
+            self._data = {v: None for v in waveforms_name}
+
+        def _get_waveform(self, waveform_name):
+            """Get the waveform points of a specified waveform"""
+
+            bin_value = self.instrument.adapter.connection.query_binary_values(
+                'WLISt:WAVeform:DATA? "' + waveform_name + '"',
+                header_fmt='ieee',
+                datatype='I')
+
+            return self.DigitalGroupWaveform(self,
+                                             waveform_name,
+                                             decimal_list=bin_value)
+
+        class DigitalGroupWaveform(abc.MutableSequence):
+            """Store and manage a digital waveform group up to 32 channels"""
+            # TODO: Fai una rappresentazione a stringa decente
+            def __init__(self, waveforms_dict, waveform_name, decimal_list=[],
+                         binary_lists=[]):
+                self._decimal_list = []
+                self._binary_lists = []
+
+                self._reset_binary()
+
+                self.waveform_name = waveform_name
+                self._waveforms_dict = waveforms_dict
+
+                if decimal_list and binary_lists:
+                    raise ValueError("Set only decimal_list or binary_lists")
+
+                if decimal_list:
+                    self._decimal_list = decimal_list
+                    self._calculate_binary()
+                elif binary_lists:
+                    for i in range(len(binary_lists)):
+                        self._binary_lists[i] = binary_lists[i]
+                    self._calculate_decimal()
+
+            def __getitem__(self, key):
+                if key < 0:
+                    raise IndexError("Digital channel numeration start from 0")
+                if key > 32:
+                    raise IndexError("Digital channel numeration ends in 32")
+
+                return tuple(self._binary_lists[key])
+
+            def __setitem__(self, key, value):
+                if key < 0:
+                    raise IndexError("Digital channel numeration start from 0")
+                if key > 32:
+                    raise IndexError("Digital channel numeration ends in 32")
+
+                # TODO: Controllo che la dimensione sia ugiale a quelli già presenti
+                self._binary_lists[key] = value
+                self._calculate_decimal()
+                self.save_waveform(self)
+
+            def __delitem__():
+                # FIXME: Trovo un raise decente
+                raise NotImplementedError()
+
+            def __len__(self):
+                return len(self._decimal_list)
+
+            def insert(self, index, object):
+                # FIXME: Trovo un raise decente
+                raise NotImplementedError()
+
+            def _set_decimal_points(self, decimal_list):
+                """Set all channel with a list containing a decimal value.
+                The channel 0 is the LSB, the channel 1 is the bit 1 and so on.
+                """
+
+                # TODO: Controllo che la dimensione sia compatibile con quelle permesse
+                # TODO: Controllo che non ci siano numeri negativi
+                self._decimal_list = decimal_list
+                self._calculate_binary()
+                self.save_waveform(self)
+
+            decimal_repr = property(lambda self: self._decimal_list,
+                                    _set_decimal_points)
+
+            def _calculate_binary(self):
+                self._reset_binary()
+
+                for dec_num in self._decimal_list:
+                    for ch in range(32):
+                        self._binary_lists[ch].append(0)
+                    conv = [int(i) for i in list('{0:0b}'.format(dec_num))]
+                    for j in range(len(conv)-1, -1, -1):
+                        self._binary_lists[j][-1] = conv[j]
+
+            def _reset_binary(self):
+                self._binary_lists = []
+                for i in range(32):
+                    self._binary_lists.append([])
+
+            def _calculate_decimal(self):
+                self._reset_decimal()
+
+                # not_empty_chs = sum([len(x) > 0 for x in self._binary_lists])
+                lists_length = 0
+                for ch_list in self._binary_lists:
+                    if len(ch_list) > lists_length:
+                        lists_length = len(ch_list)
+
+                for i in range(len(self._binary_lists)):
+                    if len(self._binary_lists[i]) != lists_length:
+                        self._binary_lists[i] = [0
+                                                 for i in range(lists_length)]
+
+                for i in range(len(self._binary_lists[0])):
+                    bin_values = []
+                    for ch in range(32-1, -1, -1):
+                        bin_values.append(self._binary_lists[ch][i])
+
+                    conv = int("".join(str(x) for x in bin_values), 2)
+                    self._decimal_list.append(conv)
+
+            def _reset_decimal(self):
+                self._decimal_list = []
 
     class DummyEntriesElements(abc.Sequence):
         """Dummy List Class to list every sequencer entry. The content is
@@ -970,6 +1223,7 @@ class AWG401x_AWG(AWG401x_base):
                 raise IndexError("Entry numeration start from 1")
             if key > int(self.instrument.values("SEQuence:LENGth?")[0]):
                 raise IndexError("Index out of range")
+
             return SequenceEntry(self.instrument, self.num_ch, key)
 
         def __len__(self):
